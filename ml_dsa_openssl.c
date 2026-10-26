@@ -20,10 +20,6 @@ enum {
     MODE_DIGESTSIGN
 };
 
-typedef struct {
-    const unsigned char *data;
-    size_t len;
-} msg_t;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -37,79 +33,32 @@ static size_t sig_size_for_alg(const char *alg)
     return 0;
 }
 
-static unsigned char *read_file(const char *path, size_t *out_len)
+static int read_message(FILE *f, unsigned char **out_data, size_t *out_len)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
-        return NULL;
+    unsigned char len_bytes[4];
+    if (fread(len_bytes, 1, 4, f) != 4) {
+        if (feof(f))
+            return 0;  /* EOF, no more messages */
+        return -1;     /* read error */
     }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz < 0) {
-        fclose(f);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_SET);
 
-    unsigned char *buf = malloc((size_t)sz);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+    uint32_t mlen = ((uint32_t)len_bytes[0] << 24) |
+                    ((uint32_t)len_bytes[1] << 16) |
+                    ((uint32_t)len_bytes[2] << 8)  |
+                     (uint32_t)len_bytes[3];
+
+    unsigned char *buf = malloc(mlen);
+    if (!buf)
+        return -1;
+
+    if (fread(buf, 1, mlen, f) != mlen) {
         free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_len = (size_t)sz;
-    return buf;
-}
-
-static int parse_messages(const unsigned char *data, size_t data_len,
-                          msg_t **out, size_t *out_count)
-{
-    size_t count = 0, off = 0;
-
-    while (off + 4 <= data_len) {
-        uint32_t mlen = ((uint32_t)data[off]     << 24) |
-                        ((uint32_t)data[off + 1] << 16) |
-                        ((uint32_t)data[off + 2] << 8)  |
-                         (uint32_t)data[off + 3];
-        off += 4;
-        if (off + mlen > data_len) {
-            fprintf(stderr, "Truncated message at index %zu\n", count);
-            return -1;
-        }
-        off += mlen;
-        count++;
-    }
-    if (off != data_len) {
-        fprintf(stderr, "Trailing data in messages file (%zu bytes)\n",
-                data_len - off);
         return -1;
     }
 
-    msg_t *msgs = calloc(count, sizeof(msg_t));
-    if (!msgs)
-        return -1;
-
-    off = 0;
-    for (size_t i = 0; i < count; i++) {
-        uint32_t mlen = ((uint32_t)data[off]     << 24) |
-                        ((uint32_t)data[off + 1] << 16) |
-                        ((uint32_t)data[off + 2] << 8)  |
-                         (uint32_t)data[off + 3];
-        off += 4;
-        msgs[i].data = data + off;
-        msgs[i].len  = mlen;
-        off += mlen;
-    }
-
-    *out       = msgs;
-    *out_count = count;
-    return 0;
+    *out_data = buf;
+    *out_len = mlen;
+    return 1;  /* success */
 }
 
 /* ------------------------------------------------------------------ */
@@ -300,28 +249,18 @@ int main(int argc, char **argv)
     }
     EVP_SIGNATURE_free(probe);
 
-    /* ---- read input files ---- */
+    /* ---- open input files ---- */
 
-    size_t seed_len = 0, msg_data_len = 0;
-    unsigned char *seed_data = read_file(seed_path, &seed_len);
-    unsigned char *msg_data  = read_file(msg_path,  &msg_data_len);
-
-    if (!seed_data || !msg_data)
-        return EXIT_USAGE;
-
-    if (seed_len == 0 || seed_len % SEED_LEN != 0) {
-        fprintf(stderr, "Seeds file size (%zu) must be a positive "
-                "multiple of %d\n", seed_len, SEED_LEN);
+    FILE *seed_file = fopen(seed_path, "rb");
+    if (!seed_file) {
+        fprintf(stderr, "Cannot open %s: %s\n", seed_path, strerror(errno));
         return EXIT_USAGE;
     }
-    size_t nkeys = seed_len / SEED_LEN;
 
-    msg_t  *msgs  = NULL;
-    size_t  nmsgs = 0;
-    if (parse_messages(msg_data, msg_data_len, &msgs, &nmsgs) < 0)
-        return EXIT_USAGE;
-    if (nmsgs == 0) {
-        fprintf(stderr, "No messages in %s\n", msg_path);
+    FILE *msg_file = fopen(msg_path, "rb");
+    if (!msg_file) {
+        fprintf(stderr, "Cannot open %s: %s\n", msg_path, strerror(errno));
+        fclose(seed_file);
         return EXIT_USAGE;
     }
 
@@ -336,13 +275,15 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "ML-DSA cross-check: %s, mode=%s%s%s\n", alg, mode_str,
             reuse_ctx ? ", reuse-ctx" : "", reuse_key ? ", reuse-key" : "");
-    fprintf(stderr, "  Seeds: %zu, Messages: %zu, Signature size: %zu\n",
-            nkeys, nmsgs, sig_sz);
+    fprintf(stderr, "  Signature size: %zu\n", sig_sz);
 
     /* ---- signing loop ---- */
 
     int ret = EXIT_OK;
     unsigned char *sig_buf = malloc(sig_sz);
+    unsigned char seed[SEED_LEN];
+    unsigned char *msg_data = NULL;
+    size_t msg_len = 0;
     EVP_PKEY *pkey = NULL;
     int deterministic = 1;
     OSSL_PARAM sign_params[] = {
@@ -359,111 +300,128 @@ int main(int argc, char **argv)
     if (mode == MODE_PKEY_SIGN)
         sa = EVP_SIGNATURE_fetch(NULL, alg, NULL);
 
-    if (reuse_ctx && mode == MODE_DIGESTSIGN)
+    if (mode == MODE_DIGESTSIGN && reuse_ctx)
         mdctx = EVP_MD_CTX_new();
 
-    for (size_t i = 0; i < nkeys; i++) {
+    /* Read one seed and one message at a time */
+    while (1) {
+        /* Read seed */
+        if (fread(seed, 1, SEED_LEN, seed_file) != SEED_LEN) {
+            if (feof(seed_file))
+                break;  /* No more seeds */
+            fprintf(stderr, "Error reading seed: %s\n", strerror(errno));
+            ret = EXIT_FAIL;
+            goto end;
+        }
+
+        /* Read message */
+        int msg_ret = read_message(msg_file, &msg_data, &msg_len);
+        if (msg_ret == 0) {
+            fprintf(stderr, "No more messages (but seeds remain)\n");
+            break;
+        }
+        if (msg_ret < 0) {
+            fprintf(stderr, "Error reading message\n");
+            ret = EXIT_FAIL;
+            goto end;
+        }
+
+        /* Generate key from seed */
         if (reuse_key) {
-            if (!key_via_fromdata(alg, seed_data + i * SEED_LEN, &pkey)) {
-                fprintf(stderr, "Key import via fromdata failed"
-                        " for seed %zu\n", i);
+            if (!key_via_fromdata(alg, seed, &pkey)) {
+                fprintf(stderr, "Key import via fromdata failed for seed %zu\n",
+                        total_sigs);
                 ERR_print_errors_fp(stderr);
                 ret = EXIT_FAIL;
+                free(msg_data);
                 goto end;
             }
         } else {
             EVP_PKEY_free(pkey);
-            pkey = keygen_from_seed(alg, seed_data + i * SEED_LEN);
+            pkey = keygen_from_seed(alg, seed);
             if (!pkey) {
-                fprintf(stderr, "Key generation failed for seed %zu\n", i);
+                fprintf(stderr, "Key generation failed for seed %zu\n",
+                        total_sigs);
                 ERR_print_errors_fp(stderr);
                 ret = EXIT_FAIL;
+                free(msg_data);
                 goto end;
             }
         }
 
-        if (reuse_ctx && mode == MODE_PKEY_SIGN) {
-            EVP_PKEY_CTX_free(pctx);
+        /* Sign the message */
+        size_t slen = sig_sz;
+
+        if (mode == MODE_PKEY_SIGN) {
+            /* For EVP_PKEY_sign, we need a fresh context for each key */
             pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
             if (!pctx) {
-                fprintf(stderr, "EVP_PKEY_CTX_new failed for seed %zu\n", i);
+                fprintf(stderr, "EVP_PKEY_CTX_new failed for signature %zu\n",
+                        total_sigs);
                 ERR_print_errors_fp(stderr);
                 ret = EXIT_FAIL;
+                free(msg_data);
                 goto end;
             }
-        }
 
-        for (size_t j = 0; j < nmsgs; j++) {
-            size_t slen = sig_sz;
-
-            if (mode == MODE_PKEY_SIGN) {
-                if (!reuse_ctx) {
-                    pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
-                    if (!pctx) {
-                        fprintf(stderr, "EVP_PKEY_CTX_new failed"
-                                " (seed %zu, msg %zu)\n", i, j);
-                        ERR_print_errors_fp(stderr);
-                        ret = EXIT_FAIL;
-                        goto end;
-                    }
-                }
-
-                if (EVP_PKEY_sign_message_init(pctx, sa, sign_params) <= 0 ||
-                    EVP_PKEY_sign(pctx, sig_buf, &slen,
-                                  msgs[j].data, msgs[j].len) <= 0) {
-                    fprintf(stderr, "Signing failed (seed %zu, msg %zu)\n",
-                            i, j);
-                    ERR_print_errors_fp(stderr);
-                    ret = EXIT_FAIL;
-                    goto end;
-                }
-
-                if (!reuse_ctx) {
-                    EVP_PKEY_CTX_free(pctx);
-                    pctx = NULL;
-                }
-            } else {
-                if (!reuse_ctx) {
-                    mdctx = EVP_MD_CTX_new();
-                    if (!mdctx) {
-                        fprintf(stderr, "EVP_MD_CTX_new failed"
-                                " (seed %zu, msg %zu)\n", i, j);
-                        ret = EXIT_FAIL;
-                        goto end;
-                    }
-                }
-
-                if (reuse_ctx && !EVP_MD_CTX_reset(mdctx)) {
-                    fprintf(stderr, "EVP_MD_CTX_reset failed"
-                            " (seed %zu, msg %zu)\n", i, j);
-                    ret = EXIT_FAIL;
-                    goto end;
-                }
-
-                if (EVP_DigestSignInit_ex(mdctx, NULL, NULL, NULL, NULL,
-                                           pkey, sign_params) <= 0 ||
-                    EVP_DigestSign(mdctx, sig_buf, &slen,
-                                   msgs[j].data, msgs[j].len) <= 0) {
-                    fprintf(stderr, "Signing failed (seed %zu, msg %zu)\n",
-                            i, j);
-                    ERR_print_errors_fp(stderr);
-                    ret = EXIT_FAIL;
-                    goto end;
-                }
-
-                if (!reuse_ctx) {
-                    EVP_MD_CTX_free(mdctx);
-                    mdctx = NULL;
-                }
-            }
-
-            if (fwrite(sig_buf, 1, sig_sz, outf) != sig_sz) {
-                fprintf(stderr, "Write error: %s\n", strerror(errno));
+            if (EVP_PKEY_sign_message_init(pctx, sa, sign_params) <= 0 ||
+                EVP_PKEY_sign(pctx, sig_buf, &slen, msg_data, msg_len) <= 0) {
+                fprintf(stderr, "Signing failed for signature %zu\n", total_sigs);
+                ERR_print_errors_fp(stderr);
                 ret = EXIT_FAIL;
+                free(msg_data);
                 goto end;
             }
-            total_sigs++;
+
+            EVP_PKEY_CTX_free(pctx);
+            pctx = NULL;
+        } else {
+            if (!reuse_ctx) {
+                mdctx = EVP_MD_CTX_new();
+                if (!mdctx) {
+                    fprintf(stderr, "EVP_MD_CTX_new failed for signature %zu\n",
+                            total_sigs);
+                    ret = EXIT_FAIL;
+                    free(msg_data);
+                    goto end;
+                }
+            }
+
+            if (reuse_ctx && !EVP_MD_CTX_reset(mdctx)) {
+                fprintf(stderr, "EVP_MD_CTX_reset failed for signature %zu\n",
+                        total_sigs);
+                ret = EXIT_FAIL;
+                free(msg_data);
+                goto end;
+            }
+
+            if (EVP_DigestSignInit_ex(mdctx, NULL, NULL, NULL, NULL,
+                                       pkey, sign_params) <= 0 ||
+                EVP_DigestSign(mdctx, sig_buf, &slen, msg_data, msg_len) <= 0) {
+                fprintf(stderr, "Signing failed for signature %zu\n", total_sigs);
+                ERR_print_errors_fp(stderr);
+                ret = EXIT_FAIL;
+                free(msg_data);
+                goto end;
+            }
+
+            if (!reuse_ctx) {
+                EVP_MD_CTX_free(mdctx);
+                mdctx = NULL;
+            }
         }
+
+        /* Write signature */
+        if (fwrite(sig_buf, 1, sig_sz, outf) != sig_sz) {
+            fprintf(stderr, "Write error: %s\n", strerror(errno));
+            ret = EXIT_FAIL;
+            free(msg_data);
+            goto end;
+        }
+
+        free(msg_data);
+        msg_data = NULL;
+        total_sigs++;
     }
 
     fprintf(stderr, "Wrote %zu signatures to %s\n", total_sigs, sig_path);
@@ -477,9 +435,8 @@ end:
     EVP_PKEY_free(pkey);
     free(sig_buf);
     fclose(outf);
-    free(msgs);
-    free(seed_data);
-    free(msg_data);
+    fclose(seed_file);
+    fclose(msg_file);
 
     return ret;
 }
